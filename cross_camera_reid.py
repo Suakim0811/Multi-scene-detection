@@ -64,6 +64,7 @@ FRAME_STRIDE = 10
 MAX_FEATURES_PER_TRACK = 15       # local track별 최근 feature 최대 저장 개수
 MIN_FEATURES_TO_MATCH = 1         # 짧은 track도 matching 후보로 사용
 MIN_DET_CONF = 0.30               # OSNet feature에 사용할 crop confidence 필터
+MIN_FEATURE_WEIGHT = 0.10         # feature 평균 가중치 하한
 MIN_BBOX_AREA = 700               # OSNet feature update에 사용할 최소 bbox area
 MIN_DET_BBOX_AREA = 800           # v8: 겹친 뒤 사람/부분 가림 bbox를 살리기 위해 완화
 MATCH_CONFIRM_COUNT = 2           # 같은 후보가 N번 이상 관측되어야 current GID 후보로 인정
@@ -109,6 +110,10 @@ def l2_normalize(feat: np.ndarray) -> np.ndarray:
     if norm < 1e-12:
         return feat
     return feat / norm
+
+
+def feature_weight(conf: float, min_weight: float = MIN_FEATURE_WEIGHT) -> float:
+    return float(max(min_weight, min(1.0, conf)))
 
 
 # ── OSNet feature extractor ──────────────────────────────────────────────────
@@ -232,25 +237,30 @@ class TrackFeatureStore:
 
     def __init__(self, max_features: int = MAX_FEATURES_PER_TRACK):
         self.max_features = max_features
-        self.buffers: Dict[Union[int, str], Deque[np.ndarray]] = defaultdict(lambda: deque(maxlen=max_features))
+        self.buffers: Dict[Union[int, str], Deque[Tuple[np.ndarray, float]]] = defaultdict(lambda: deque(maxlen=max_features))
         self.last_seen: Dict[Union[int, str], int] = {}
 
-    def update(self, key: Union[int, str], feat: np.ndarray, frame_idx: int):
-        self.buffers[key].append(l2_normalize(feat.astype(np.float32)))
+    def update(self, key: Union[int, str], feat: np.ndarray, frame_idx: int, weight: float = 1.0):
+        self.buffers[key].append((l2_normalize(feat.astype(np.float32)), float(weight)))
         self.last_seen[key] = frame_idx
 
     def get_mean(self, key: Union[int, str]) -> Optional[np.ndarray]:
         buf = self.buffers.get(key)
         if not buf:
             return None
-        mean_feat = np.mean(np.stack(list(buf), axis=0), axis=0)
+        feats = [f for (f, _w) in buf]
+        weights = np.array([_w for (_f, _w) in buf], dtype=np.float32)
+        if np.sum(weights) <= 1e-6:
+            mean_feat = np.mean(np.stack(feats, axis=0), axis=0)
+        else:
+            mean_feat = np.average(np.stack(feats, axis=0), axis=0, weights=weights)
         return l2_normalize(mean_feat.astype(np.float32))
 
     def get_features(self, key: Union[int, str]) -> List[np.ndarray]:
         buf = self.buffers.get(key)
         if not buf:
             return []
-        return list(buf)
+        return [f for (f, _w) in buf]
 
     def count(self, key: Union[int, str]) -> int:
         buf = self.buffers.get(key)
@@ -389,18 +399,18 @@ class Gallery:
             return False
         return True
 
-    def _assign_new_gid_for_b(self, local_id: int, feat: np.ndarray, frame_idx: int) -> int:
+    def _assign_new_gid_for_b(self, local_id: int, feat: np.ndarray, frame_idx: int, weight: float = 1.0) -> int:
         new_gid = self._new_gid()
         self._release_gid_if_owned(local_id, self.b_current_gid.get(local_id))
         self.b_current_gid[local_id] = new_gid
         self.gid_owner_b[new_gid] = local_id
-        self._update_gid_memory(new_gid, feat, frame_idx, "B")
+        self._update_gid_memory(new_gid, feat, frame_idx, "B", weight=weight)
         return new_gid
 
-    def _update_gid_memory(self, gid: int, feat: np.ndarray, frame_idx: int, cam: str):
+    def _update_gid_memory(self, gid: int, feat: np.ndarray, frame_idx: int, cam: str, weight: float = 1.0):
         if gid is None or gid < 0:
             return
-        self.store_gid.update(gid, feat, frame_idx)
+        self.store_gid.update(gid, feat, frame_idx, weight=weight)
         self.gid_last_seen[gid] = frame_idx
         self.gid_last_cam[gid] = cam
 
@@ -517,12 +527,12 @@ class Gallery:
             return best_gid
         return None
 
-    def update_cam_a(self, local_id: int, feat: np.ndarray, frame_idx: int) -> int:
+    def update_cam_a(self, local_id: int, feat: np.ndarray, frame_idx: int, weight: float = 1.0) -> int:
         """
         Camera A local track update.
         v7에서는 새 local ID가 등장해도 바로 새 GID를 만들지 않고, 기존 Global ID memory와 먼저 비교한다.
         """
-        self.store_a.update(local_id, feat, frame_idx)
+        self.store_a.update(local_id, feat, frame_idx, weight=weight)
 
         if local_id in self.a_gid:
             gid = self.a_gid[local_id]
@@ -533,7 +543,7 @@ class Gallery:
             self.a_gid[local_id] = gid
             self.gid_owner_a[gid] = local_id
 
-        self._update_gid_memory(gid, feat, frame_idx, "A")
+        self._update_gid_memory(gid, feat, frame_idx, "A", weight=weight)
         return gid
 
     def _update_current_assignment(self, b_lid: int, latest_best_gid: Optional[int] = None):
@@ -569,13 +579,13 @@ class Gallery:
 
         self._try_assign_gid(b_lid, best_gid)
 
-    def update_cam_b_and_match(self, local_id: int, feat: np.ndarray, frame_idx: int) -> Tuple[int, Optional[float]]:
+    def update_cam_b_and_match(self, local_id: int, feat: np.ndarray, frame_idx: int, weight: float = 1.0) -> Tuple[int, Optional[float]]:
         """
         Camera B local track update and match against Global ID memory.
         새 B local ID는 바로 새 양수 GID를 만들지 않고 TMP로 시작한다.
         기존 GID memory와 충분히 유사한 evidence가 쌓였을 때 그 GID를 이어받는다.
         """
-        self.store_b.update(local_id, feat, frame_idx)
+        self.store_b.update(local_id, feat, frame_idx, weight=weight)
         self._decay_evidence(local_id)
 
         if self.store_b.count(local_id) < self.min_features_to_match:
@@ -586,7 +596,7 @@ class Gallery:
         ranked_candidates = self._rank_gid_candidates(self.store_b, local_id, cam="B", exclude_active_same_cam=True)
         if not ranked_candidates:
             if self._should_create_new_gid_for_b(local_id):
-                gid = self._assign_new_gid_for_b(local_id, feat, frame_idx)
+                gid = self._assign_new_gid_for_b(local_id, feat, frame_idx, weight=weight)
                 return gid, None
             gid = self.b_current_gid.get(local_id, self._get_temp_gid(local_id))
             self.b_current_gid[local_id] = gid
@@ -597,7 +607,7 @@ class Gallery:
         self.b_last_best_dist[local_id] = best_dist
 
         if best_dist > self.threshold and self._should_create_new_gid_for_b(local_id):
-            gid = self._assign_new_gid_for_b(local_id, feat, frame_idx)
+            gid = self._assign_new_gid_for_b(local_id, feat, frame_idx, weight=weight)
             return gid, best_dist
 
         if best_dist <= self.threshold and (second_dist - best_dist) >= self.distance_margin:
@@ -612,7 +622,7 @@ class Gallery:
         # 너무 이른 오매칭 feature가 archive를 오염시키는 것을 막기 위한 조건이다.
         if gid is not None and gid >= 0:
             if self.b_hits[local_id].get(gid, 0) >= self.confirm_count and self.b_evidence[local_id].get(gid, 0.0) >= self.min_evidence:
-                self._update_gid_memory(gid, feat, frame_idx, "B")
+                self._update_gid_memory(gid, feat, frame_idx, "B", weight=weight)
 
         return gid, best_dist
 
@@ -1076,7 +1086,7 @@ def run(
                     if crop is not None:
                         feat = extractor.extract(crop)
                         if feat is not None:
-                            gid = gallery.update_cam_a(lid, feat, frame_idx)
+                            gid = gallery.update_cam_a(lid, feat, frame_idx, weight=feature_weight(conf))
                         else:
                             gid = gallery.get_gid(lid, "A")
                     else:
@@ -1106,7 +1116,7 @@ def run(
                     if crop is not None:
                         feat = extractor.extract(crop)
                         if feat is not None:
-                            gid, _best_dist = gallery.update_cam_b_and_match(lid, feat, frame_idx)
+                            gid, _best_dist = gallery.update_cam_b_and_match(lid, feat, frame_idx, weight=feature_weight(conf))
                         else:
                             gid = gallery.get_gid(lid, "B")
                     else:
