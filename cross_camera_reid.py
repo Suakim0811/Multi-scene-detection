@@ -45,10 +45,10 @@ from ultralytics import YOLO
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
 YOLO_MODEL = "yolo11m.pt"  # v10 안정형 기본값. 더 강하게는 yolo11l.pt / yolo11x.pt
-OSNET_MODEL = "osnet_x1_0"
+OSNET_MODEL = "osnet_ain_x1_0"
 OSNET_WEIGHTS = "market1501"  # Re-ID pretrained weights
 OSNET_HF_REPO = "MYerassyl/retail-heat-osnet"
-OSNET_HF_FILENAME = "osnet_x1_0_market1501.pth"
+OSNET_HF_FILENAME = "osnet_ain_x1_0_market1501.pth"
 PERSON_CLASS = 0
 
 # OSNet feature는 cosine similarity가 높을수록 유사함.
