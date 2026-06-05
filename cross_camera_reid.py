@@ -46,7 +46,7 @@ from ultralytics import YOLO
 # ── 설정 ──────────────────────────────────────────────────────────────────────
 YOLO_MODEL = "yolo11m.pt"  # v10 안정형 기본값. 더 강하게는 yolo11l.pt / yolo11x.pt
 OSNET_MODEL = "osnet_ain_x1_0"
-OSNET_WEIGHTS = "market1501"  # Re-ID pretrained weights
+OSNET_WEIGHTS = "msmt17"  # Re-ID pretrained weights
 OSNET_HF_REPO = "kaiyangzhou/osnet"
 OSNET_HF_FILENAME = "osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth"
 PERSON_CLASS = 0
@@ -325,6 +325,7 @@ class Gallery:
         distance_margin: float = DISTANCE_MARGIN,
         memory_max_age: int = 900,
         reassoc_margin: float = 0.02,
+        allow_b_gid_creation: bool = True,
     ):
         self.threshold = threshold
         self.max_age = max_age
@@ -332,6 +333,7 @@ class Gallery:
         self.reassoc_margin = float(reassoc_margin)
         self.min_features_to_match = min_features_to_match
         self.confirm_count = confirm_count
+        self.allow_b_gid_creation = bool(allow_b_gid_creation)
         self.topk = topk
         weight_sum = max(1e-6, mean_weight + set_weight)
         self.mean_weight = mean_weight / weight_sum
@@ -375,6 +377,24 @@ class Gallery:
         if local_id not in self.b_temp_gid:
             self.b_temp_gid[local_id] = -(local_id + 1)
         return self.b_temp_gid[local_id]
+
+    def _should_create_new_gid_for_b(self, local_id: int) -> bool:
+        if not self.allow_b_gid_creation:
+            return False
+        if self.store_b.count(local_id) < max(self.min_features_to_match, self.confirm_count):
+            return False
+        current = self.b_current_gid.get(local_id)
+        if current is not None and current >= 0:
+            return False
+        return True
+
+    def _assign_new_gid_for_b(self, local_id: int, feat: np.ndarray, frame_idx: int) -> int:
+        new_gid = self._new_gid()
+        self._release_gid_if_owned(local_id, self.b_current_gid.get(local_id))
+        self.b_current_gid[local_id] = new_gid
+        self.gid_owner_b[new_gid] = local_id
+        self._update_gid_memory(new_gid, feat, frame_idx, "B")
+        return new_gid
 
     def _update_gid_memory(self, gid: int, feat: np.ndarray, frame_idx: int, cam: str):
         if gid is None or gid < 0:
@@ -564,6 +584,9 @@ class Gallery:
 
         ranked_candidates = self._rank_gid_candidates(self.store_b, local_id, cam="B", exclude_active_same_cam=True)
         if not ranked_candidates:
+            if self._should_create_new_gid_for_b(local_id):
+                gid = self._assign_new_gid_for_b(local_id, feat, frame_idx)
+                return gid, None
             gid = self.b_current_gid.get(local_id, self._get_temp_gid(local_id))
             self.b_current_gid[local_id] = gid
             return gid, None
@@ -571,6 +594,10 @@ class Gallery:
         best_gid, best_dist = ranked_candidates[0]
         second_dist = ranked_candidates[1][1] if len(ranked_candidates) > 1 else float("inf")
         self.b_last_best_dist[local_id] = best_dist
+
+        if best_dist > self.threshold and self._should_create_new_gid_for_b(local_id):
+            gid = self._assign_new_gid_for_b(local_id, feat, frame_idx)
+            return gid, best_dist
 
         if best_dist <= self.threshold and (second_dist - best_dist) >= self.distance_margin:
             sim = max(0.0, 1.0 - best_dist)
