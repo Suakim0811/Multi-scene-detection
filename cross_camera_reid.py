@@ -89,6 +89,7 @@ MIN_ASPECT_RATIO = 0.20                  # bbox width/height 최소 비율. 너�
 MAX_ASPECT_RATIO = 1.20                  # bbox width/height 최대 비율. 너무 넓으면 여러 사람이 섞였을 가능성
 GLOBAL_MEMORY_MAX_AGE = 900             # 사라진 GID를 archive에 유지할 프레임 수
 REASSOC_DISTANCE_MARGIN = 0.02          # 새 local track을 기존 GID와 재연결할 때 best/second distance 차이 조건
+HEIGHT_DROP_RATIO = 0.60                # bbox 높이가 이전 대비 이 비율 이하로 줄면 부분 가림으로 간주
 
 # ── 색상 팔레트 ───────────────────────────────────────────────────────────────
 PALETTE = [
@@ -781,6 +782,19 @@ def valid_crop(
     return crop
 
 
+def is_partial_occlusion_by_height(
+    lid: int,
+    bbox_h: int,
+    last_heights: Dict[int, int],
+    drop_ratio: float = HEIGHT_DROP_RATIO,
+) -> bool:
+    prev_h = last_heights.get(lid)
+    last_heights[lid] = bbox_h
+    if prev_h is None or prev_h <= 0:
+        return False
+    return bbox_h <= int(prev_h * drop_ratio)
+
+
 # ── 시각화 헬퍼 ───────────────────────────────────────────────────────────────
 def draw_box(frame, x1, y1, x2, y2, gid, local_id, cam_label):
     color = get_color(gid)
@@ -953,6 +967,7 @@ def run(
     memory_max_age: int = GLOBAL_MEMORY_MAX_AGE,
     reassoc_margin: float = REASSOC_DISTANCE_MARGIN,
     min_det_area: int = MIN_DET_BBOX_AREA,
+    height_drop_ratio: float = HEIGHT_DROP_RATIO,
 ):
     global MATCH_THRESHOLD
 
@@ -969,6 +984,7 @@ def run(
     print(f"[INFO] Evidence : confirm={confirm_count}, decay={evidence_decay}, min={min_evidence}, ev_margin={evidence_margin}, switch_margin={switch_margin}, dist_margin={distance_margin}")
     print(f"[INFO] Occlusion-aware update : {'ON' if skip_occluded_update else 'OFF'}, occ_iou={occ_iou}, edge_margin={edge_margin}, aspect=[{min_aspect}, {max_aspect}]")
     print(f"[INFO] GID archive : memory_max_age={memory_max_age}, reassoc_margin={reassoc_margin}")
+    print(f"[INFO] Height drop filter : ratio={height_drop_ratio}")
     print(f"[INFO] Display window : {'ON' if show else 'OFF'}")
 
     print("[INFO] Loading YOLO + ByteTrack ...")
@@ -1018,6 +1034,8 @@ def run(
 
     frame_idx = 0
     paused = False
+    last_heights_a: Dict[int, int] = {}
+    last_heights_b: Dict[int, int] = {}
 
     if show:
         print("[INFO] Starting — press Q to quit, P/Space to pause")
@@ -1046,7 +1064,14 @@ def run(
             dets_a = filter_small_detections(dets_a, min_det_area)
             occluded_a = find_occluded_track_ids(dets_a, occ_iou) if skip_occluded_update else set()
             for (lid, x1, y1, x2, y2, conf) in dets_a:
+                bbox_h = max(1, y2 - y1)
+                height_drop = is_partial_occlusion_by_height(lid, bbox_h, last_heights_a, height_drop_ratio)
                 if is_feature_frame and lid not in occluded_a:
+                    if height_drop:
+                        gid = gallery.get_gid(lid, "A")
+                        gid_map_a[lid] = gid
+                        cache_a.append((lid, x1, y1, x2, y2, gid))
+                        continue
                     crop = valid_crop(frame_a, x1, y1, x2, y2, conf, edge_margin, min_aspect, max_aspect)
                     if crop is not None:
                         feat = extractor.extract(crop)
@@ -1069,7 +1094,14 @@ def run(
             dets_b = filter_small_detections(dets_b, min_det_area)
             occluded_b = find_occluded_track_ids(dets_b, occ_iou) if skip_occluded_update else set()
             for (lid, x1, y1, x2, y2, conf) in dets_b:
+                bbox_h = max(1, y2 - y1)
+                height_drop = is_partial_occlusion_by_height(lid, bbox_h, last_heights_b, height_drop_ratio)
                 if is_feature_frame and lid not in occluded_b:
+                    if height_drop:
+                        gid = gallery.get_gid(lid, "B")
+                        gid_map_b[lid] = gid
+                        cache_b.append((lid, x1, y1, x2, y2, gid))
+                        continue
                     crop = valid_crop(frame_b, x1, y1, x2, y2, conf, edge_margin, min_aspect, max_aspect)
                     if crop is not None:
                         feat = extractor.extract(crop)
@@ -1172,6 +1204,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_aspect", type=float, default=MAX_ASPECT_RATIO, help=f"feature update에 사용할 bbox width/height 최대 비율 (기본: {MAX_ASPECT_RATIO})")
     parser.add_argument("--memory_max_age", type=int, default=GLOBAL_MEMORY_MAX_AGE, help=f"사라진 GID를 archive에 유지할 프레임 수 (기본: {GLOBAL_MEMORY_MAX_AGE})")
     parser.add_argument("--reassoc_margin", type=float, default=REASSOC_DISTANCE_MARGIN, help=f"새 local track을 기존 GID와 재연결할 때 best/second distance 차이 조건 (기본: {REASSOC_DISTANCE_MARGIN})")
+    parser.add_argument("--height_drop_ratio", type=float, default=HEIGHT_DROP_RATIO, help=f"bbox 높이가 이전 대비 이 비율 이하로 줄면 부분 가림으로 간주 (기본: {HEIGHT_DROP_RATIO})")
 
     args = parser.parse_args()
 
@@ -1222,6 +1255,7 @@ if __name__ == "__main__":
                 memory_max_age=args.memory_max_age,
                 reassoc_margin=args.reassoc_margin,
                 min_det_area=args.min_det_area,
+                height_drop_ratio=args.height_drop_ratio,
             )
 
         print(f"\n[INFO] 전체 {len(pairs)}쌍 처리 완료.")
