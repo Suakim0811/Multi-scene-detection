@@ -101,6 +101,15 @@ CROSS_MATCH_WEIGHT = 0.10
 PARTIAL_UPPER_WEIGHT = 0.70
 PARTIAL_CROSS_WEIGHT = 0.30
 
+# motion-aware gating (same camera)
+MOTION_SIGMA = 0.60
+MIN_MOTION_SCORE = 0.20
+KALMAN_POS_VAR = 1.0
+KALMAN_VEL_VAR = 1.0
+KALMAN_MEAS_VAR = 10.0
+KALMAN_Q_POS_SCALE = 0.01
+KALMAN_Q_VEL_SCALE = 0.01
+
 # ── 색상 팔레트 ───────────────────────────────────────────────────────────────
 PALETTE = [
     (220, 80, 80), (80, 180, 80), (80, 120, 220),
@@ -622,15 +631,17 @@ class Gallery:
         frame_idx: int,
         weight: float = 1.0,
         is_partial: bool = False,
+        motion_score: float = 1.0,
     ) -> int:
         """
         Camera A local track update.
         v7에서는 새 local ID가 등장해도 바로 새 GID를 만들지 않고, 기존 Global ID memory와 먼저 비교한다.
         """
+        effective_weight = float(weight) * float(motion_score)
         if feat_full is not None and not is_partial:
-            self.store_a_full.update(local_id, feat_full, frame_idx, weight=weight)
+            self.store_a_full.update(local_id, feat_full, frame_idx, weight=effective_weight)
         if feat_upper is not None:
-            self.store_a_upper.update(local_id, feat_upper, frame_idx, weight=weight)
+            self.store_a_upper.update(local_id, feat_upper, frame_idx, weight=effective_weight)
 
         if local_id in self.a_gid:
             gid = self.a_gid[local_id]
@@ -643,9 +654,9 @@ class Gallery:
             self.gid_owner_a[gid] = local_id
 
         if feat_upper is not None:
-            self._update_gid_memory(gid, feat_upper, frame_idx, "A", weight=weight, upper=True)
+            self._update_gid_memory(gid, feat_upper, frame_idx, "A", weight=effective_weight, upper=True)
         if feat_full is not None and not is_partial:
-            self._update_gid_memory(gid, feat_full, frame_idx, "A", weight=weight, upper=False)
+            self._update_gid_memory(gid, feat_full, frame_idx, "A", weight=effective_weight, upper=False)
         return gid
 
     def _update_current_assignment(self, b_lid: int, latest_best_gid: Optional[int] = None):
@@ -689,16 +700,18 @@ class Gallery:
         frame_idx: int,
         weight: float = 1.0,
         is_partial: bool = False,
+        motion_score: float = 1.0,
     ) -> Tuple[int, Optional[float]]:
         """
         Camera B local track update and match against Global ID memory.
         새 B local ID는 바로 새 양수 GID를 만들지 않고 TMP로 시작한다.
         기존 GID memory와 충분히 유사한 evidence가 쌓였을 때 그 GID를 이어받는다.
         """
+        effective_weight = float(weight) * float(motion_score)
         if feat_full is not None and not is_partial:
-            self.store_b_full.update(local_id, feat_full, frame_idx, weight=weight)
+            self.store_b_full.update(local_id, feat_full, frame_idx, weight=effective_weight)
         if feat_upper is not None:
-            self.store_b_upper.update(local_id, feat_upper, frame_idx, weight=weight)
+            self.store_b_upper.update(local_id, feat_upper, frame_idx, weight=effective_weight)
         self._decay_evidence(local_id)
 
         local_count = max(self.store_b_full.count(local_id), self.store_b_upper.count(local_id))
@@ -711,7 +724,7 @@ class Gallery:
         ranked_candidates = self._rank_gid_candidates(local_id, cam="B", is_partial=is_partial, exclude_active_same_cam=True)
         if not ranked_candidates:
             if self._should_create_new_gid_for_b(local_count, local_id):
-                gid = self._assign_new_gid_for_b(local_id, feat_full, feat_upper, frame_idx, weight=weight, is_partial=is_partial)
+                gid = self._assign_new_gid_for_b(local_id, feat_full, feat_upper, frame_idx, weight=effective_weight, is_partial=is_partial)
                 return gid, None
             gid = self.b_current_gid.get(local_id, self._get_temp_gid(local_id))
             self.b_current_gid[local_id] = gid
@@ -722,12 +735,12 @@ class Gallery:
         self.b_last_best_dist[local_id] = best_dist
 
         if best_dist > self.threshold and self._should_create_new_gid_for_b(local_count, local_id):
-            gid = self._assign_new_gid_for_b(local_id, feat_full, feat_upper, frame_idx, weight=weight, is_partial=is_partial)
+            gid = self._assign_new_gid_for_b(local_id, feat_full, feat_upper, frame_idx, weight=effective_weight, is_partial=is_partial)
             return gid, best_dist
 
         if best_dist <= self.threshold and (second_dist - best_dist) >= self.distance_margin:
             sim = max(0.0, 1.0 - best_dist)
-            self.b_evidence[local_id][best_gid] += sim
+            self.b_evidence[local_id][best_gid] += sim * float(motion_score)
             self.b_hits[local_id][best_gid] += 1
 
         self._update_current_assignment(local_id, latest_best_gid=best_gid)
@@ -738,9 +751,9 @@ class Gallery:
         if gid is not None and gid >= 0:
             if self.b_hits[local_id].get(gid, 0) >= self.confirm_count and self.b_evidence[local_id].get(gid, 0.0) >= self.min_evidence:
                 if feat_upper is not None:
-                    self._update_gid_memory(gid, feat_upper, frame_idx, "B", weight=weight, upper=True)
+                    self._update_gid_memory(gid, feat_upper, frame_idx, "B", weight=effective_weight, upper=True)
                 if feat_full is not None and not is_partial:
-                    self._update_gid_memory(gid, feat_full, frame_idx, "B", weight=weight, upper=False)
+                    self._update_gid_memory(gid, feat_full, frame_idx, "B", weight=effective_weight, upper=False)
 
         return gid, best_dist
 
@@ -924,6 +937,79 @@ def make_upper_bbox(
     h = max(1, y2 - y1)
     upper_h = max(1, int(h * ratio))
     return x1, y1, x2, y1 + upper_h
+
+
+def kalman_motion_score(
+    lid: int,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    frame_idx: int,
+    states: Dict[int, Dict[str, Union[np.ndarray, int]]],
+    sigma: float = MOTION_SIGMA,
+    min_score: float = MIN_MOTION_SCORE,
+    pos_var: float = KALMAN_POS_VAR,
+    vel_var: float = KALMAN_VEL_VAR,
+    meas_var: float = KALMAN_MEAS_VAR,
+    q_pos_scale: float = KALMAN_Q_POS_SCALE,
+    q_vel_scale: float = KALMAN_Q_VEL_SCALE,
+) -> float:
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    h = max(1, y2 - y1)
+    z = np.array([cx, cy], dtype=np.float32)
+
+    state = states.get(lid)
+    if state is None:
+        x = np.array([cx, cy, 0.0, 0.0], dtype=np.float32)
+        P = np.diag([pos_var, pos_var, vel_var, vel_var]).astype(np.float32)
+        states[lid] = {"x": x, "P": P, "t": frame_idx, "h": h}
+        return 1.0
+
+    x = state["x"]
+    P = state["P"]
+    last_t = int(state["t"])
+    dt = max(1, frame_idx - last_t)
+
+    F = np.array(
+        [[1.0, 0.0, float(dt), 0.0],
+         [0.0, 1.0, 0.0, float(dt)],
+         [0.0, 0.0, 1.0, 0.0],
+         [0.0, 0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    Q = np.diag([
+        pos_var * q_pos_scale * dt,
+        pos_var * q_pos_scale * dt,
+        vel_var * q_vel_scale * dt,
+        vel_var * q_vel_scale * dt,
+    ]).astype(np.float32)
+
+    x_pred = F @ x
+    P_pred = F @ P @ F.T + Q
+
+    H = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], dtype=np.float32)
+    R = np.diag([meas_var, meas_var]).astype(np.float32)
+
+    y = z - (H @ x_pred)
+    S = H @ P_pred @ H.T + R
+    try:
+        S_inv = np.linalg.inv(S)
+    except np.linalg.LinAlgError:
+        S_inv = np.linalg.pinv(S)
+    K = P_pred @ H.T @ S_inv
+    x_new = x_pred + K @ y
+    P_new = (np.eye(4, dtype=np.float32) - K @ H) @ P_pred
+
+    states[lid] = {"x": x_new, "P": P_new, "t": frame_idx, "h": h}
+
+    residual = float(np.hypot(y[0], y[1]))
+    rel = residual / max(1.0, float(h))
+    if sigma <= 1e-6:
+        return min_score
+    score = float(np.exp(-(rel * rel) / (2.0 * sigma * sigma)))
+    return max(min_score, min(1.0, score))
 
 
 def is_partial_occlusion_by_height(
@@ -1180,6 +1266,8 @@ def run(
     paused = False
     last_heights_a: Dict[int, int] = {}
     last_heights_b: Dict[int, int] = {}
+    last_motion_a: Dict[int, Dict[str, Union[np.ndarray, int]]] = {}
+    last_motion_b: Dict[int, Dict[str, Union[np.ndarray, int]]] = {}
 
     if show:
         print("[INFO] Starting — press Q to quit, P/Space to pause")
@@ -1210,6 +1298,7 @@ def run(
             for (lid, x1, y1, x2, y2, conf) in dets_a:
                 bbox_h = max(1, y2 - y1)
                 height_drop = is_partial_occlusion_by_height(lid, bbox_h, last_heights_a, height_drop_ratio)
+                motion_score = kalman_motion_score(lid, x1, y1, x2, y2, frame_idx, last_motion_a)
                 if is_feature_frame and lid not in occluded_a:
                     upper_box = make_upper_bbox(x1, y1, x2, y2, ratio=UPPER_CROP_RATIO)
                     crop_full = valid_crop(frame_a, x1, y1, x2, y2, conf, edge_margin, min_aspect, max_aspect, min_bbox_area=MIN_BBOX_AREA)
@@ -1220,12 +1309,28 @@ def run(
 
                     if height_drop:
                         if feat_upper is not None:
-                            gid = gallery.update_cam_a(lid, None, feat_upper, frame_idx, weight=feature_weight(conf), is_partial=True)
+                            gid = gallery.update_cam_a(
+                                lid,
+                                None,
+                                feat_upper,
+                                frame_idx,
+                                weight=feature_weight(conf),
+                                is_partial=True,
+                                motion_score=motion_score,
+                            )
                         else:
                             gid = gallery.get_gid(lid, "A")
                     else:
                         if feat_full is not None or feat_upper is not None:
-                            gid = gallery.update_cam_a(lid, feat_full, feat_upper, frame_idx, weight=feature_weight(conf), is_partial=False)
+                            gid = gallery.update_cam_a(
+                                lid,
+                                feat_full,
+                                feat_upper,
+                                frame_idx,
+                                weight=feature_weight(conf),
+                                is_partial=False,
+                                motion_score=motion_score,
+                            )
                         else:
                             gid = gallery.get_gid(lid, "A")
                 else:
@@ -1243,6 +1348,7 @@ def run(
             for (lid, x1, y1, x2, y2, conf) in dets_b:
                 bbox_h = max(1, y2 - y1)
                 height_drop = is_partial_occlusion_by_height(lid, bbox_h, last_heights_b, height_drop_ratio)
+                motion_score = kalman_motion_score(lid, x1, y1, x2, y2, frame_idx, last_motion_b)
                 if is_feature_frame and lid not in occluded_b:
                     upper_box = make_upper_bbox(x1, y1, x2, y2, ratio=UPPER_CROP_RATIO)
                     crop_full = valid_crop(frame_b, x1, y1, x2, y2, conf, edge_margin, min_aspect, max_aspect, min_bbox_area=MIN_BBOX_AREA)
@@ -1253,12 +1359,28 @@ def run(
 
                     if height_drop:
                         if feat_upper is not None:
-                            gid, _best_dist = gallery.update_cam_b_and_match(lid, None, feat_upper, frame_idx, weight=feature_weight(conf), is_partial=True)
+                            gid, _best_dist = gallery.update_cam_b_and_match(
+                                lid,
+                                None,
+                                feat_upper,
+                                frame_idx,
+                                weight=feature_weight(conf),
+                                is_partial=True,
+                                motion_score=motion_score,
+                            )
                         else:
                             gid = gallery.get_gid(lid, "B")
                     else:
                         if feat_full is not None or feat_upper is not None:
-                            gid, _best_dist = gallery.update_cam_b_and_match(lid, feat_full, feat_upper, frame_idx, weight=feature_weight(conf), is_partial=False)
+                            gid, _best_dist = gallery.update_cam_b_and_match(
+                                lid,
+                                feat_full,
+                                feat_upper,
+                                frame_idx,
+                                weight=feature_weight(conf),
+                                is_partial=False,
+                                motion_score=motion_score,
+                            )
                         else:
                             gid = gallery.get_gid(lid, "B")
                 else:
