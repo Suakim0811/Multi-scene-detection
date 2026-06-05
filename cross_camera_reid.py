@@ -91,6 +91,15 @@ MAX_ASPECT_RATIO = 1.20                  # bbox width/height 최대 비율. 너�
 GLOBAL_MEMORY_MAX_AGE = 900             # 사라진 GID를 archive에 유지할 프레임 수
 REASSOC_DISTANCE_MARGIN = 0.02          # 새 local track을 기존 GID와 재연결할 때 best/second distance 차이 조건
 HEIGHT_DROP_RATIO = 0.60                # bbox 높이가 이전 대비 이 비율 이하로 줄면 부분 가림으로 간주
+UPPER_CROP_RATIO = 0.55                 # 상반신 crop 높이 비율
+MIN_UPPER_BBOX_AREA = int(MIN_BBOX_AREA * 0.60)
+
+# dual feature matching weights
+FULL_MATCH_WEIGHT = 0.60
+UPPER_MATCH_WEIGHT = 0.30
+CROSS_MATCH_WEIGHT = 0.10
+PARTIAL_UPPER_WEIGHT = 0.70
+PARTIAL_CROSS_WEIGHT = 0.30
 
 # ── 색상 팔레트 ───────────────────────────────────────────────────────────────
 PALETTE = [
@@ -356,12 +365,15 @@ class Gallery:
         self.switch_margin = float(switch_margin)
         self.distance_margin = float(distance_margin)
 
-        # local track별 feature buffer
-        self.store_a = TrackFeatureStore(max_features=max_features)
-        self.store_b = TrackFeatureStore(max_features=max_features)
+        # local track별 feature buffer (full/upper)
+        self.store_a_full = TrackFeatureStore(max_features=max_features)
+        self.store_a_upper = TrackFeatureStore(max_features=max_features)
+        self.store_b_full = TrackFeatureStore(max_features=max_features)
+        self.store_b_upper = TrackFeatureStore(max_features=max_features)
 
-        # Global ID별 feature archive. local track이 사라져도 이 memory는 일정 시간 유지된다.
-        self.store_gid = TrackFeatureStore(max_features=max_features * 2)
+        # Global ID별 feature archive (full/upper). local track이 사라져도 이 memory는 일정 시간 유지된다.
+        self.store_gid_full = TrackFeatureStore(max_features=max_features * 2)
+        self.store_gid_upper = TrackFeatureStore(max_features=max_features * 2)
         self.gid_last_seen: Dict[int, int] = {}
         self.gid_last_cam: Dict[int, str] = {}
 
@@ -389,28 +401,40 @@ class Gallery:
             self.b_temp_gid[local_id] = -(local_id + 1)
         return self.b_temp_gid[local_id]
 
-    def _should_create_new_gid_for_b(self, local_id: int) -> bool:
+    def _should_create_new_gid_for_b(self, feature_count: int, local_id: int) -> bool:
         if not self.allow_b_gid_creation:
             return False
-        if self.store_b.count(local_id) < max(self.min_features_to_match, self.confirm_count):
+        if feature_count < max(self.min_features_to_match, self.confirm_count):
             return False
         current = self.b_current_gid.get(local_id)
         if current is not None and current >= 0:
             return False
         return True
 
-    def _assign_new_gid_for_b(self, local_id: int, feat: np.ndarray, frame_idx: int, weight: float = 1.0) -> int:
+    def _assign_new_gid_for_b(
+        self,
+        local_id: int,
+        feat_full: Optional[np.ndarray],
+        feat_upper: Optional[np.ndarray],
+        frame_idx: int,
+        weight: float = 1.0,
+        is_partial: bool = False,
+    ) -> int:
         new_gid = self._new_gid()
         self._release_gid_if_owned(local_id, self.b_current_gid.get(local_id))
         self.b_current_gid[local_id] = new_gid
         self.gid_owner_b[new_gid] = local_id
-        self._update_gid_memory(new_gid, feat, frame_idx, "B", weight=weight)
+        if feat_upper is not None:
+            self._update_gid_memory(new_gid, feat_upper, frame_idx, "B", weight=weight, upper=True)
+        if feat_full is not None and not is_partial:
+            self._update_gid_memory(new_gid, feat_full, frame_idx, "B", weight=weight, upper=False)
         return new_gid
 
-    def _update_gid_memory(self, gid: int, feat: np.ndarray, frame_idx: int, cam: str, weight: float = 1.0):
-        if gid is None or gid < 0:
+    def _update_gid_memory(self, gid: int, feat: np.ndarray, frame_idx: int, cam: str, weight: float = 1.0, upper: bool = False):
+        if gid is None or gid < 0 or feat is None:
             return
-        self.store_gid.update(gid, feat, frame_idx, weight=weight)
+        store = self.store_gid_upper if upper else self.store_gid_full
+        store.update(gid, feat, frame_idx, weight=weight)
         self.gid_last_seen[gid] = frame_idx
         self.gid_last_cam[gid] = cam
 
@@ -431,35 +455,98 @@ class Gallery:
         final_sim = self.mean_weight * mean_sim + self.set_weight * set_sim
         return float(1.0 - final_sim)
 
-    def _track_to_gid_distance(self, store: TrackFeatureStore, lid: int, gid: int) -> Optional[float]:
-        return self._distance_feature_sets(
-            store.get_mean(lid),
-            store.get_features(lid),
-            self.store_gid.get_mean(gid),
-            self.store_gid.get_features(gid),
+    def _get_local_store(self, cam: str, upper: bool) -> TrackFeatureStore:
+        if cam == "A":
+            return self.store_a_upper if upper else self.store_a_full
+        return self.store_b_upper if upper else self.store_b_full
+
+    def _get_gid_store(self, upper: bool) -> TrackFeatureStore:
+        return self.store_gid_upper if upper else self.store_gid_full
+
+    def _gid_keys(self) -> List[int]:
+        return list(set(self.store_gid_full.keys()) | set(self.store_gid_upper.keys()))
+
+    def _similarity_from_stores(
+        self,
+        store_local: TrackFeatureStore,
+        lid: int,
+        store_gid: TrackFeatureStore,
+        gid: int,
+    ) -> Optional[float]:
+        if store_local.count(lid) < self.min_features_to_match:
+            return None
+        if store_gid.count(gid) < self.min_features_to_match:
+            return None
+        dist = self._distance_feature_sets(
+            store_local.get_mean(lid),
+            store_local.get_features(lid),
+            store_gid.get_mean(gid),
+            store_gid.get_features(gid),
         )
+        if dist is None:
+            return None
+        return float(max(0.0, 1.0 - dist))
+
+    def _average_optional(self, values: List[Optional[float]]) -> Optional[float]:
+        vals = [v for v in values if v is not None]
+        if not vals:
+            return None
+        return float(np.mean(vals))
+
+    def _combine_similarity(
+        self,
+        sim_full: Optional[float],
+        sim_upper: Optional[float],
+        sim_cross: Optional[float],
+        is_partial: bool,
+    ) -> Optional[float]:
+        if is_partial:
+            sims = [sim_upper, sim_cross]
+            weights = [PARTIAL_UPPER_WEIGHT, PARTIAL_CROSS_WEIGHT]
+        else:
+            sims = [sim_full, sim_upper, sim_cross]
+            weights = [FULL_MATCH_WEIGHT, UPPER_MATCH_WEIGHT, CROSS_MATCH_WEIGHT]
+
+        weighted = [(s, w) for s, w in zip(sims, weights) if s is not None]
+        if not weighted:
+            return None
+        total = sum(w for _s, w in weighted)
+        if total <= 1e-6:
+            return None
+        return float(sum(s * w for s, w in weighted) / total)
 
     def _rank_gid_candidates(
         self,
-        store: TrackFeatureStore,
         lid: int,
         cam: str,
+        is_partial: bool,
         exclude_active_same_cam: bool = True,
     ) -> List[Tuple[int, float]]:
         """local track을 Global ID memory와 비교해 (gid, distance) 후보를 반환한다."""
         candidates: List[Tuple[int, float]] = []
-        for gid in self.store_gid.keys():
-            if gid < 0 or self.store_gid.count(gid) < self.min_features_to_match:
+        local_full = self._get_local_store(cam, upper=False)
+        local_upper = self._get_local_store(cam, upper=True)
+
+        for gid in self._gid_keys():
+            if gid < 0:
                 continue
             if exclude_active_same_cam:
                 if cam == "A" and self.gid_owner_a.get(gid) is not None and self.gid_owner_a.get(gid) != lid:
                     continue
                 if cam == "B" and self.gid_owner_b.get(gid) is not None and self.gid_owner_b.get(gid) != lid:
                     continue
-            dist = self._track_to_gid_distance(store, lid, gid)
-            if dist is None:
+
+            sim_full = self._similarity_from_stores(local_full, lid, self.store_gid_full, gid)
+            sim_upper = self._similarity_from_stores(local_upper, lid, self.store_gid_upper, gid)
+            sim_cross = self._average_optional([
+                self._similarity_from_stores(local_upper, lid, self.store_gid_full, gid),
+                self._similarity_from_stores(local_full, lid, self.store_gid_upper, gid),
+            ])
+            sim = self._combine_similarity(sim_full, sim_upper, sim_cross, is_partial)
+            if sim is None:
                 continue
-            candidates.append((gid, dist))
+            candidates.append((gid, float(1.0 - sim)))
+
         candidates.sort(key=lambda x: x[1])
         return candidates
 
@@ -516,9 +603,9 @@ class Gallery:
         self.gid_owner_b[candidate_gid] = b_lid
         return True
 
-    def _select_existing_gid_for_a(self, local_id: int) -> Optional[int]:
+    def _select_existing_gid_for_a(self, local_id: int, is_partial: bool) -> Optional[int]:
         """A camera의 새 local track이 기존 GID memory와 이어질 수 있는지 확인한다."""
-        candidates = self._rank_gid_candidates(self.store_a, local_id, cam="A", exclude_active_same_cam=True)
+        candidates = self._rank_gid_candidates(local_id, cam="A", is_partial=is_partial, exclude_active_same_cam=True)
         if not candidates:
             return None
         best_gid, best_dist = candidates[0]
@@ -527,23 +614,38 @@ class Gallery:
             return best_gid
         return None
 
-    def update_cam_a(self, local_id: int, feat: np.ndarray, frame_idx: int, weight: float = 1.0) -> int:
+    def update_cam_a(
+        self,
+        local_id: int,
+        feat_full: Optional[np.ndarray],
+        feat_upper: Optional[np.ndarray],
+        frame_idx: int,
+        weight: float = 1.0,
+        is_partial: bool = False,
+    ) -> int:
         """
         Camera A local track update.
         v7에서는 새 local ID가 등장해도 바로 새 GID를 만들지 않고, 기존 Global ID memory와 먼저 비교한다.
         """
-        self.store_a.update(local_id, feat, frame_idx, weight=weight)
+        if feat_full is not None and not is_partial:
+            self.store_a_full.update(local_id, feat_full, frame_idx, weight=weight)
+        if feat_upper is not None:
+            self.store_a_upper.update(local_id, feat_upper, frame_idx, weight=weight)
 
         if local_id in self.a_gid:
             gid = self.a_gid[local_id]
         else:
-            gid = self._select_existing_gid_for_a(local_id)
+            use_partial = is_partial or feat_full is None
+            gid = self._select_existing_gid_for_a(local_id, use_partial)
             if gid is None:
                 gid = self._new_gid()
             self.a_gid[local_id] = gid
             self.gid_owner_a[gid] = local_id
 
-        self._update_gid_memory(gid, feat, frame_idx, "A", weight=weight)
+        if feat_upper is not None:
+            self._update_gid_memory(gid, feat_upper, frame_idx, "A", weight=weight, upper=True)
+        if feat_full is not None and not is_partial:
+            self._update_gid_memory(gid, feat_full, frame_idx, "A", weight=weight, upper=False)
         return gid
 
     def _update_current_assignment(self, b_lid: int, latest_best_gid: Optional[int] = None):
@@ -579,24 +681,37 @@ class Gallery:
 
         self._try_assign_gid(b_lid, best_gid)
 
-    def update_cam_b_and_match(self, local_id: int, feat: np.ndarray, frame_idx: int, weight: float = 1.0) -> Tuple[int, Optional[float]]:
+    def update_cam_b_and_match(
+        self,
+        local_id: int,
+        feat_full: Optional[np.ndarray],
+        feat_upper: Optional[np.ndarray],
+        frame_idx: int,
+        weight: float = 1.0,
+        is_partial: bool = False,
+    ) -> Tuple[int, Optional[float]]:
         """
         Camera B local track update and match against Global ID memory.
         새 B local ID는 바로 새 양수 GID를 만들지 않고 TMP로 시작한다.
         기존 GID memory와 충분히 유사한 evidence가 쌓였을 때 그 GID를 이어받는다.
         """
-        self.store_b.update(local_id, feat, frame_idx, weight=weight)
+        if feat_full is not None and not is_partial:
+            self.store_b_full.update(local_id, feat_full, frame_idx, weight=weight)
+        if feat_upper is not None:
+            self.store_b_upper.update(local_id, feat_upper, frame_idx, weight=weight)
         self._decay_evidence(local_id)
 
-        if self.store_b.count(local_id) < self.min_features_to_match:
+        local_count = max(self.store_b_full.count(local_id), self.store_b_upper.count(local_id))
+
+        if local_count < self.min_features_to_match:
             gid = self.b_current_gid.get(local_id, self._get_temp_gid(local_id))
             self.b_current_gid[local_id] = gid
             return gid, None
 
-        ranked_candidates = self._rank_gid_candidates(self.store_b, local_id, cam="B", exclude_active_same_cam=True)
+        ranked_candidates = self._rank_gid_candidates(local_id, cam="B", is_partial=is_partial, exclude_active_same_cam=True)
         if not ranked_candidates:
-            if self._should_create_new_gid_for_b(local_id):
-                gid = self._assign_new_gid_for_b(local_id, feat, frame_idx, weight=weight)
+            if self._should_create_new_gid_for_b(local_count, local_id):
+                gid = self._assign_new_gid_for_b(local_id, feat_full, feat_upper, frame_idx, weight=weight, is_partial=is_partial)
                 return gid, None
             gid = self.b_current_gid.get(local_id, self._get_temp_gid(local_id))
             self.b_current_gid[local_id] = gid
@@ -606,8 +721,8 @@ class Gallery:
         second_dist = ranked_candidates[1][1] if len(ranked_candidates) > 1 else float("inf")
         self.b_last_best_dist[local_id] = best_dist
 
-        if best_dist > self.threshold and self._should_create_new_gid_for_b(local_id):
-            gid = self._assign_new_gid_for_b(local_id, feat, frame_idx, weight=weight)
+        if best_dist > self.threshold and self._should_create_new_gid_for_b(local_count, local_id):
+            gid = self._assign_new_gid_for_b(local_id, feat_full, feat_upper, frame_idx, weight=weight, is_partial=is_partial)
             return gid, best_dist
 
         if best_dist <= self.threshold and (second_dist - best_dist) >= self.distance_margin:
@@ -622,7 +737,10 @@ class Gallery:
         # 너무 이른 오매칭 feature가 archive를 오염시키는 것을 막기 위한 조건이다.
         if gid is not None and gid >= 0:
             if self.b_hits[local_id].get(gid, 0) >= self.confirm_count and self.b_evidence[local_id].get(gid, 0.0) >= self.min_evidence:
-                self._update_gid_memory(gid, feat, frame_idx, "B", weight=weight)
+                if feat_upper is not None:
+                    self._update_gid_memory(gid, feat_upper, frame_idx, "B", weight=weight, upper=True)
+                if feat_full is not None and not is_partial:
+                    self._update_gid_memory(gid, feat_full, frame_idx, "B", weight=weight, upper=False)
 
         return gid, best_dist
 
@@ -633,13 +751,16 @@ class Gallery:
 
     def expire(self, frame_idx: int):
         # local track store는 짧게 expire한다. Global ID memory는 더 오래 유지한다.
-        self.store_a.expire(frame_idx, self.max_age)
-        self.store_b.expire(frame_idx, self.max_age)
-        self.store_gid.expire(frame_idx, self.memory_max_age)
+        self.store_a_full.expire(frame_idx, self.max_age)
+        self.store_a_upper.expire(frame_idx, self.max_age)
+        self.store_b_full.expire(frame_idx, self.max_age)
+        self.store_b_upper.expire(frame_idx, self.max_age)
+        self.store_gid_full.expire(frame_idx, self.memory_max_age)
+        self.store_gid_upper.expire(frame_idx, self.memory_max_age)
 
-        valid_a = set(self.store_a.keys())
-        valid_b = set(self.store_b.keys())
-        valid_gid = set(self.store_gid.keys())
+        valid_a = set(self.store_a_full.keys()) | set(self.store_a_upper.keys())
+        valid_b = set(self.store_b_full.keys()) | set(self.store_b_upper.keys())
+        valid_gid = set(self.store_gid_full.keys()) | set(self.store_gid_upper.keys())
 
         for lid in list(self.a_gid.keys()):
             if lid not in valid_a:
@@ -751,6 +872,7 @@ def valid_crop(
     edge_margin_ratio: float = EDGE_MARGIN_RATIO,
     min_aspect_ratio: float = MIN_ASPECT_RATIO,
     max_aspect_ratio: float = MAX_ASPECT_RATIO,
+    min_bbox_area: int = MIN_BBOX_AREA,
 ) -> Optional[np.ndarray]:
     if conf < MIN_DET_CONF:
         return None
@@ -759,7 +881,7 @@ def valid_crop(
     bw_raw = max(1, x2 - x1)
     bh_raw = max(1, y2 - y1)
     raw_area = bw_raw * bh_raw
-    if raw_area < MIN_BBOX_AREA:
+    if raw_area < min_bbox_area:
         return None
 
     # 사람이 너무 얇거나 너무 넓게 잡힌 crop은 bbox 품질이 낮거나 여러 사람이 섞였을 가능성이 있다.
@@ -790,6 +912,18 @@ def valid_crop(
     if crop.size == 0:
         return None
     return crop
+
+
+def make_upper_bbox(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    ratio: float = UPPER_CROP_RATIO,
+) -> Tuple[int, int, int, int]:
+    h = max(1, y2 - y1)
+    upper_h = max(1, int(h * ratio))
+    return x1, y1, x2, y1 + upper_h
 
 
 def is_partial_occlusion_by_height(
@@ -1077,20 +1211,23 @@ def run(
                 bbox_h = max(1, y2 - y1)
                 height_drop = is_partial_occlusion_by_height(lid, bbox_h, last_heights_a, height_drop_ratio)
                 if is_feature_frame and lid not in occluded_a:
+                    upper_box = make_upper_bbox(x1, y1, x2, y2, ratio=UPPER_CROP_RATIO)
+                    crop_full = valid_crop(frame_a, x1, y1, x2, y2, conf, edge_margin, min_aspect, max_aspect, min_bbox_area=MIN_BBOX_AREA)
+                    crop_upper = valid_crop(frame_a, *upper_box, conf, edge_margin, min_aspect, max_aspect, min_bbox_area=MIN_UPPER_BBOX_AREA)
+
+                    feat_full = extractor.extract(crop_full) if crop_full is not None else None
+                    feat_upper = extractor.extract(crop_upper) if crop_upper is not None else None
+
                     if height_drop:
-                        gid = gallery.get_gid(lid, "A")
-                        gid_map_a[lid] = gid
-                        cache_a.append((lid, x1, y1, x2, y2, gid))
-                        continue
-                    crop = valid_crop(frame_a, x1, y1, x2, y2, conf, edge_margin, min_aspect, max_aspect)
-                    if crop is not None:
-                        feat = extractor.extract(crop)
-                        if feat is not None:
-                            gid = gallery.update_cam_a(lid, feat, frame_idx, weight=feature_weight(conf))
+                        if feat_upper is not None:
+                            gid = gallery.update_cam_a(lid, None, feat_upper, frame_idx, weight=feature_weight(conf), is_partial=True)
                         else:
                             gid = gallery.get_gid(lid, "A")
                     else:
-                        gid = gallery.get_gid(lid, "A")
+                        if feat_full is not None or feat_upper is not None:
+                            gid = gallery.update_cam_a(lid, feat_full, feat_upper, frame_idx, weight=feature_weight(conf), is_partial=False)
+                        else:
+                            gid = gallery.get_gid(lid, "A")
                 else:
                     gid = gallery.get_gid(lid, "A")
 
@@ -1107,20 +1244,23 @@ def run(
                 bbox_h = max(1, y2 - y1)
                 height_drop = is_partial_occlusion_by_height(lid, bbox_h, last_heights_b, height_drop_ratio)
                 if is_feature_frame and lid not in occluded_b:
+                    upper_box = make_upper_bbox(x1, y1, x2, y2, ratio=UPPER_CROP_RATIO)
+                    crop_full = valid_crop(frame_b, x1, y1, x2, y2, conf, edge_margin, min_aspect, max_aspect, min_bbox_area=MIN_BBOX_AREA)
+                    crop_upper = valid_crop(frame_b, *upper_box, conf, edge_margin, min_aspect, max_aspect, min_bbox_area=MIN_UPPER_BBOX_AREA)
+
+                    feat_full = extractor.extract(crop_full) if crop_full is not None else None
+                    feat_upper = extractor.extract(crop_upper) if crop_upper is not None else None
+
                     if height_drop:
-                        gid = gallery.get_gid(lid, "B")
-                        gid_map_b[lid] = gid
-                        cache_b.append((lid, x1, y1, x2, y2, gid))
-                        continue
-                    crop = valid_crop(frame_b, x1, y1, x2, y2, conf, edge_margin, min_aspect, max_aspect)
-                    if crop is not None:
-                        feat = extractor.extract(crop)
-                        if feat is not None:
-                            gid, _best_dist = gallery.update_cam_b_and_match(lid, feat, frame_idx, weight=feature_weight(conf))
+                        if feat_upper is not None:
+                            gid, _best_dist = gallery.update_cam_b_and_match(lid, None, feat_upper, frame_idx, weight=feature_weight(conf), is_partial=True)
                         else:
                             gid = gallery.get_gid(lid, "B")
                     else:
-                        gid = gallery.get_gid(lid, "B")
+                        if feat_full is not None or feat_upper is not None:
+                            gid, _best_dist = gallery.update_cam_b_and_match(lid, feat_full, feat_upper, frame_idx, weight=feature_weight(conf), is_partial=False)
+                        else:
+                            gid = gallery.get_gid(lid, "B")
                 else:
                     gid = gallery.get_gid(lid, "B")
 
