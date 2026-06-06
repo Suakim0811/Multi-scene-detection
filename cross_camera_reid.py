@@ -659,7 +659,8 @@ class Gallery:
             return gid
     
         use_partial = is_partial or feat_full is None
-        self.a_pending_frames[local_id] = self.a_pending_frames.get(local_id, 0) + 1
+        if feat_upper is not None or feat_full is not None:
+            self.a_pending_frames[local_id] = self.a_pending_frames.get(local_id, 0) + 1
 
         gid = self._select_existing_gid_for_a(local_id, use_partial)
 
@@ -810,7 +811,7 @@ class Gallery:
             if lid not in valid_a:
                 self.a_temp_gid.pop(lid, None)
                 self.a_pending_frames.pop(lid, None)
-                
+
         for lid in list(self.b_current_gid.keys()):
             if lid not in valid_b:
                 old_gid = self.b_current_gid.pop(lid, None)
