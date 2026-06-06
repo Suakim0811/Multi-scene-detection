@@ -110,6 +110,8 @@ KALMAN_MEAS_VAR = 10.0
 KALMAN_Q_POS_SCALE = 0.01
 KALMAN_Q_VEL_SCALE = 0.01
 
+A_PENDING_THRESHOLD = 5
+
 # ── 색상 팔레트 ───────────────────────────────────────────────────────────────
 PALETTE = [
     (220, 80, 80), (80, 180, 80), (80, 120, 220),
@@ -387,6 +389,8 @@ class Gallery:
         self.gid_last_cam: Dict[int, str] = {}
 
         self.a_gid: Dict[int, int] = {}
+        self.a_temp_gid: Dict[int, int] = {}
+        self.a_pending_frames: Dict[int, int] = {}
         self.b_current_gid: Dict[int, int] = {}   # 현재 evidence상 가장 그럴듯한 global GID 또는 TMP 음수 ID
         self.b_temp_gid: Dict[int, int] = {}      # 아직 global GID와 연결되지 않은 B track 표시용 TMP 음수 ID
         self.b_evidence: Dict[int, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
@@ -409,6 +413,11 @@ class Gallery:
         if local_id not in self.b_temp_gid:
             self.b_temp_gid[local_id] = -(local_id + 1)
         return self.b_temp_gid[local_id]
+
+    def _get_temp_gid_a(self, local_id: int)->int:
+        if local_id not in self.a_temp_gid:
+            self.a_temp_gid[local_id] = -(10_000 + local_id + 1)
+        return self.a_temp_gid[local_id]
 
     def _should_create_new_gid_for_b(self, feature_count: int, local_id: int) -> bool:
         if not self.allow_b_gid_creation:
@@ -645,19 +654,35 @@ class Gallery:
 
         if local_id in self.a_gid:
             gid = self.a_gid[local_id]
-        else:
-            use_partial = is_partial or feat_full is None
-            gid = self._select_existing_gid_for_a(local_id, use_partial)
-            if gid is None:
-                gid = self._new_gid()
+            if feat_upper is not None:
+                self._update_gid_memory(gid, feat_upper, frame_idx, "A", weight=effective_weight, upper=False)
+            return gid
+    
+        use_partial = is_partial or feat_full is None
+        self.a_pending_frames[local_id] = self.a_pending_frames.get(local_id, 0) + 1
+
+        gid = self._select_existing_gid_for_a(local_id, use_partial)
+
+        if gid is not None:
             self.a_gid[local_id] = gid
             self.gid_owner_a[gid] = local_id
-
+            self.a_temp_gid.pop(local_id, None)
+            self.a_pending_frames.pop(local_id, None)
+        elif self.a_pending_frames[local_id] >= A_PENDING_THRESHOLD:
+            gid = self._new_gid()
+            self.a_gid[local_id] = gid
+            self.gid_owner_a[gid] = local_id
+            self.a_temp_gid.pop(local_id, None)
+            self.a_pending_frames.pop(local_id, None)
+        else:
+            gid = self._get_temp_gid_a(local_id)
+            return gid
+            
         if feat_upper is not None:
             self._update_gid_memory(gid, feat_upper, frame_idx, "A", weight=effective_weight, upper=True)
         if feat_full is not None and not is_partial:
             self._update_gid_memory(gid, feat_full, frame_idx, "A", weight=effective_weight, upper=False)
-        return gid
+            return gid
 
     def _update_current_assignment(self, b_lid: int, latest_best_gid: Optional[int] = None):
         """누적 evidence를 보고 B track의 current GID를 신규 설정하거나 재배정한다."""
@@ -781,6 +806,11 @@ class Gallery:
                 if old_gid is not None and self.gid_owner_a.get(old_gid) == lid:
                     self.gid_owner_a.pop(old_gid, None)
 
+        for lid in list(self.a_temp_gid.keys()):
+            if lid not in valid_a:
+                self.a_temp_gid.pop(lid, None)
+                self.a_pending_frames.pop(lid, None)
+                
         for lid in list(self.b_current_gid.keys()):
             if lid not in valid_b:
                 old_gid = self.b_current_gid.pop(lid, None)
