@@ -54,11 +54,11 @@ PERSON_CLASS = 0
 # OSNet feature는 cosine similarity가 높을수록 유사함.
 # 기존 코드는 cosine distance threshold였지만, CLI 의미를 유지하기 위해 threshold는 distance 기준으로 사용.
 # 예: distance 0.35 이하면 같은 사람 후보로 봄 = similarity 0.65 이상.
-MATCH_THRESHOLD = 0.50
+MATCH_THRESHOLD = 0.35
 GALLERY_MAX_AGE = 300
 DISPLAY_W = 640
 DISPLAY_H = 480
-FRAME_STRIDE = 10
+FRAME_STRIDE = 5
 
 # feature aggregation / matching 안정화 설정
 MAX_FEATURES_PER_TRACK = 15       # local track별 최근 feature 최대 저장 개수
@@ -67,12 +67,12 @@ MIN_DET_CONF = 0.30               # OSNet feature에 사용할 crop confidence �
 MIN_FEATURE_WEIGHT = 0.10         # feature 평균 가중치 하한
 MIN_BBOX_AREA = 700               # OSNet feature update에 사용할 최소 bbox area
 MIN_DET_BBOX_AREA = 800           # v8: 겹친 뒤 사람/부분 가림 bbox를 살리기 위해 완화
-MATCH_CONFIRM_COUNT = 2           # 같은 후보가 N번 이상 관측되어야 current GID 후보로 인정
+MATCH_CONFIRM_COUNT = 4          # 같은 후보가 N번 이상 관측되어야 current GID 후보로 인정
 EVIDENCE_DECAY = 0.90             # feature frame마다 기존 evidence를 감쇠해 오래된 오판 영향 감소
-MIN_EVIDENCE = 1.00               # current GID로 표시하기 위한 최소 evidence
+MIN_EVIDENCE = 2.00               # current GID로 표시하기 위한 최소 evidence
 EVIDENCE_MARGIN = 0.25            # 1등 evidence와 2등 evidence의 최소 차이
 SWITCH_MARGIN = 0.40              # 이미 배정된 GID를 바꾸기 위해 필요한 추가 evidence 차이
-DISTANCE_MARGIN = 0.03            # best distance와 second-best distance의 최소 차이
+DISTANCE_MARGIN = 0.05            # best distance와 second-best distance의 최소 차이
 YOLO_IMGSZ = 1280                 # 작은 사람/겹침 상황 개선: 기본 640보다 크게 추론
 YOLO_CONF = 0.18                  # v10: 너무 작은 과검출을 줄이면서 부분 가림도 일부 허용
 YOLO_IOU = 0.85                   # v8: NMS IoU를 높여 겹친 사람 bbox가 제거되는 것을 줄임
